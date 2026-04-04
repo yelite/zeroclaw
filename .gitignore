@@ -78,6 +78,7 @@ playground/
 
 # Temporary rustc output
 rust_out
+/.direnv
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/

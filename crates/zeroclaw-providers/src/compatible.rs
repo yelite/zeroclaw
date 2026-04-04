@@ -1006,6 +1006,7 @@ fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
     None
 }
 
+
 fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
     choice
         .delta
@@ -1305,6 +1306,20 @@ fn sse_bytes_to_events_for_contract(
                                 }
                             }
 
+                            if let Some(reasoning_delta) =
+                                extract_sse_reasoning_delta(choice)
+                            {
+                                let reasoning_chunk =
+                                    StreamChunk::reasoning(reasoning_delta);
+                                if tx
+                                    .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+
                             if let Some(deltas) = choice.delta.tool_calls.as_ref() {
                                 for delta in deltas {
                                     let index = delta.index.unwrap_or(tool_calls.len());
@@ -1458,7 +1473,7 @@ impl OpenAiCompatibleProvider {
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
 
-        messages
+        let converted: Vec<NativeMessage> = messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
@@ -1498,10 +1513,17 @@ impl OpenAiCompatibleProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    let reasoning_content = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    // Thinking models (kimi-k2.5, DeepSeek-R1, etc.) require
+                    // reasoning_content on every assistant tool-call message,
+                    // even if empty.  Default to "" when the field is absent
+                    // (e.g. messages persisted before the fix).
+                    let reasoning_content = Some(
+                        value
+                            .get("reasoning_content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    );
 
                     return NativeMessage {
                         role: "assistant".to_string(),
@@ -1555,6 +1577,39 @@ impl OpenAiCompatibleProvider {
                     tool_calls: None,
                     reasoning_content: None,
                 }
+            })
+            .collect();
+
+        // Drop orphaned tool-result messages whose tool_call_id doesn't match
+        // any tool_call in a preceding assistant message.  Context compression
+        // and emergency history trimming can remove assistant messages while
+        // leaving their tool results behind, which providers reject.
+        let mut known_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for msg in &converted {
+            if let Some(ref calls) = msg.tool_calls {
+                for tc in calls {
+                    if let Some(ref id) = tc.id {
+                        known_ids.insert(id.clone());
+                    }
+                }
+            }
+        }
+
+        converted
+            .into_iter()
+            .filter(|msg| {
+                if msg.role == "tool" {
+                    if let Some(ref id) = msg.tool_call_id {
+                        if !known_ids.contains(id) {
+                            tracing::debug!(
+                                tool_call_id = %id,
+                                "Dropping orphaned tool result (no matching assistant tool_call)"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                true
             })
             .collect()
     }
@@ -3114,17 +3169,24 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_maps_tool_result_payload() {
-        let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_abc","content":"done"}"#,
-        )];
+        let input = vec![
+            // Assistant message with a matching tool_call so the tool result
+            // is not dropped by the orphan filter.
+            ChatMessage::assistant(
+                r#"{"content":"checking","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_abc","content":"done"}"#,
+            ),
+        ];
 
         let provider = make_provider("test", "https://example.com", None);
         let converted = provider.convert_messages_for_native(&input, true);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "tool");
-        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[1].role, "tool");
+        assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
-            converted[0].content.as_ref(),
+            converted[1].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
     }
@@ -3183,6 +3245,22 @@ mod tests {
         assert_ne!(assistant_id, invalid_id);
         assert!(is_valid_mistral_tool_call_id(assistant_id));
         assert_eq!(assistant_id, tool_id);
+    }
+
+    #[test]
+    fn convert_messages_for_native_drops_orphaned_tool_results() {
+        let input = vec![
+            ChatMessage::user("hello"),
+            // Orphaned tool result — no assistant message has tool_call "call_gone"
+            ChatMessage::tool(r#"{"tool_call_id":"call_gone","content":"orphaned"}"#),
+            ChatMessage::assistant("response"),
+        ];
+
+        let provider = make_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(converted[1].role, "assistant");
     }
 
     #[test]
@@ -4170,8 +4248,9 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_no_reasoning_content_when_absent() {
-        // Normal model history without reasoning_content key
+    fn convert_messages_for_native_defaults_reasoning_content_when_absent() {
+        // Assistant tool-call messages always get reasoning_content (even if
+        // empty) so thinking models like kimi-k2.5 don't reject the history.
         let history_json = serde_json::json!({
             "content": "I will check",
             "tool_calls": [{
@@ -4185,7 +4264,7 @@ mod tests {
         let provider = make_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
-        assert!(native[0].reasoning_content.is_none());
+        assert_eq!(native[0].reasoning_content.as_deref(), Some(""));
     }
 
     #[test]
