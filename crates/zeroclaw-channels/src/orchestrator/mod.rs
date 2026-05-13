@@ -4285,6 +4285,12 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_channel_filter(dc.channel_ids.clone(), dc.blocked_channel_ids.clone())
+                .with_mention_overrides(
+                    dc.mention_free_channels.clone(),
+                    dc.mention_required_channels.clone(),
+                )
+                .with_thread_mention_bypass(dc.mention_free_in_threads)
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_streaming(
                     dc.stream_mode,
@@ -4754,6 +4760,15 @@ fn collect_configured_channels(
                         dc.listen_to_bots,
                         dc.mention_only,
                     )
+                    .with_channel_filter(
+                        dc.channel_ids.clone(),
+                        dc.blocked_channel_ids.clone(),
+                    )
+                    .with_mention_overrides(
+                        dc.mention_free_channels.clone(),
+                        dc.mention_required_channels.clone(),
+                    )
+                    .with_thread_mention_bypass(dc.mention_free_in_threads)
                     .with_workspace_dir(config.workspace_dir.clone())
                     .with_streaming(
                         dc.stream_mode,

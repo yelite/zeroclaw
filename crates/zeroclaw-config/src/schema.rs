@@ -7296,6 +7296,32 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Channel-ID allowlist. When non-empty, only messages from these
+    /// channels (or threads whose parent is listed) are admitted. Empty =
+    /// no filter (all channels in the configured guild are admitted).
+    /// DMs from `allowed_users` are always admitted regardless.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    /// Channel-ID blocklist. Messages from these channels (or threads
+    /// whose parent is listed) are always dropped, even if the channel
+    /// also appears in `channel_ids`.
+    #[serde(default)]
+    pub blocked_channel_ids: Vec<String>,
+    /// Channels (or thread parents) listed here never require an
+    /// @-mention, regardless of the global `mention_only` setting.
+    /// Wins over `mention_required_channels` when both list the same ID.
+    #[serde(default)]
+    pub mention_free_channels: Vec<String>,
+    /// Channels (or thread parents) listed here always require an
+    /// @-mention, even when the global `mention_only` is false.
+    #[serde(default)]
+    pub mention_required_channels: Vec<String>,
+    /// When true, messages in a thread where the bot is a member are
+    /// admitted without an @-mention, even when the parent channel
+    /// would otherwise require one. Uses one cached call to
+    /// `GET /channels/{thread_id}/thread-members/@me`. Default: true.
+    #[serde(default = "default_true")]
+    pub mention_free_in_threads: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
@@ -13547,16 +13573,7 @@ default_temperature = 0.7
             enabled: true,
             bot_token: "discord-token".into(),
             guild_id: Some("12345".into()),
-            allowed_users: vec![],
-            listen_to_bots: false,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            proxy_url: None,
-            stream_mode: StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            multi_message_delay_ms: 800,
-            stall_timeout_secs: 0,
-            approval_timeout_secs: 300,
+            ..Default::default()
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -13569,21 +13586,41 @@ default_temperature = 0.7
         let dc = DiscordConfig {
             enabled: true,
             bot_token: "tok".into(),
-            guild_id: None,
-            allowed_users: vec![],
-            listen_to_bots: false,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            proxy_url: None,
-            stream_mode: StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            multi_message_delay_ms: 800,
-            stall_timeout_secs: 0,
-            approval_timeout_secs: 300,
+            ..Default::default()
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.guild_id.is_none());
+    }
+
+    #[test]
+    async fn discord_config_defaults_new_fields() {
+        let json = r#"{"bot_token":"tok"}"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.channel_ids.is_empty());
+        assert!(parsed.blocked_channel_ids.is_empty());
+        assert!(parsed.mention_free_channels.is_empty());
+        assert!(parsed.mention_required_channels.is_empty());
+        // Default is true so threads bypass mention out of the box.
+        assert!(parsed.mention_free_in_threads);
+    }
+
+    #[test]
+    async fn discord_config_parses_channel_lists() {
+        let json = r#"{
+            "bot_token": "tok",
+            "channel_ids": ["111", "222"],
+            "blocked_channel_ids": ["333"],
+            "mention_free_channels": ["444"],
+            "mention_required_channels": ["555"],
+            "mention_free_in_threads": false
+        }"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.channel_ids, vec!["111", "222"]);
+        assert_eq!(parsed.blocked_channel_ids, vec!["333"]);
+        assert_eq!(parsed.mention_free_channels, vec!["444"]);
+        assert_eq!(parsed.mention_required_channels, vec!["555"]);
+        assert!(!parsed.mention_free_in_threads);
     }
 
     // ── iMessage / Matrix config ────────────────────────────

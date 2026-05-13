@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -51,12 +51,38 @@ pub struct DiscordChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
-    /// Cached `channel_id -> is_thread` lookups. Populated lazily on first
-    /// inbound message from a channel via `GET /channels/{id}`. Thread type
-    /// is stable for the channel's lifetime so the cache lives as long as
-    /// the channel instance.
-    thread_channels: Arc<AsyncMutex<HashMap<String, bool>>>,
+    /// Channel-ID allowlist. When non-empty, only messages whose
+    /// `channel_id` (or thread parent) match are admitted.
+    channel_allowlist: Vec<String>,
+    /// Channel-ID blocklist. Wins over allowlist when both list the same ID.
+    channel_blocklist: Vec<String>,
+    /// Channels (or thread parents) that never require an @-mention.
+    mention_free_channels: Vec<String>,
+    /// Channels (or thread parents) that always require an @-mention.
+    mention_required_channels: Vec<String>,
+    /// When true, threads where the bot is a member bypass the mention gate.
+    mention_free_in_threads: bool,
+    /// Cached `channel_id -> ChannelMeta` lookups. Populated lazily on first
+    /// inbound message via `GET /channels/{id}`. Both `is_thread` and the
+    /// `parent_id` are stable for the channel's lifetime, so the cache lives
+    /// as long as the channel instance.
+    channel_meta: Arc<AsyncMutex<HashMap<String, ChannelMeta>>>,
+    /// Cached `thread_id -> (is_member, expires_at)` lookups for the bot's
+    /// thread membership. TTL-cached because membership can change while
+    /// the process is running.
+    thread_membership: Arc<AsyncMutex<HashMap<String, (bool, Instant)>>>,
 }
+
+#[derive(Clone, Debug, Default)]
+struct ChannelMeta {
+    is_thread: bool,
+    parent_id: Option<String>,
+}
+
+/// How long a positive/negative `thread-members/@me` lookup stays valid.
+/// Threads can add/remove members at any time; we re-check periodically
+/// so a removed bot stops bypassing the mention gate within minutes.
+const THREAD_MEMBERSHIP_TTL: Duration = Duration::from_secs(300);
 
 impl DiscordChannel {
     pub fn new(
@@ -86,8 +112,46 @@ impl DiscordChannel {
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
-            thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            channel_allowlist: Vec::new(),
+            channel_blocklist: Vec::new(),
+            mention_free_channels: Vec::new(),
+            mention_required_channels: Vec::new(),
+            mention_free_in_threads: true,
+            channel_meta: Arc::new(AsyncMutex::new(HashMap::new())),
+            thread_membership: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// Configure per-channel allow/block lists. Empty `allowlist` means no
+    /// restriction. Both lists accept the channel's own ID or a thread's
+    /// parent ID.
+    pub fn with_channel_filter(
+        mut self,
+        allowlist: Vec<String>,
+        blocklist: Vec<String>,
+    ) -> Self {
+        self.channel_allowlist = allowlist;
+        self.channel_blocklist = blocklist;
+        self
+    }
+
+    /// Per-channel overrides for the global `mention_only` setting.
+    /// `free` channels never require a mention; `required` channels always
+    /// do. `free` wins when both lists name the same channel.
+    pub fn with_mention_overrides(
+        mut self,
+        free: Vec<String>,
+        required: Vec<String>,
+    ) -> Self {
+        self.mention_free_channels = free;
+        self.mention_required_channels = required;
+        self
+    }
+
+    /// When true, threads where the bot is a member bypass the mention gate.
+    pub fn with_thread_mention_bypass(mut self, enabled: bool) -> Self {
+        self.mention_free_in_threads = enabled;
+        self
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -168,27 +232,25 @@ impl DiscordChannel {
         base64_decode(part)
     }
 
-    /// Resolve whether `channel_id` is a Discord thread (ANNOUNCEMENT,
-    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Results are
-    /// cached for the channel instance's lifetime: thread-ness is stable
-    /// for a given channel ID, so one lookup per ID per process. Failures
-    /// (network, 429, missing `type` field) fall through to `false` so a
-    /// transient API hiccup never blocks inbound delivery.
-    async fn is_thread_channel(&self, client: &reqwest::Client, channel_id: &str) -> bool {
+    /// Resolve channel metadata (whether it's a thread, and its parent ID
+    /// when applicable) via `GET /channels/{id}`. Results are cached for the
+    /// channel instance's lifetime: both fields are stable for a given
+    /// channel ID. Failures (network, 429, missing `type` field) fall
+    /// through to a default `ChannelMeta` so a transient API hiccup never
+    /// blocks inbound delivery; the failure is not cached, so the next
+    /// message retries.
+    async fn lookup_channel_meta(
+        &self,
+        client: &reqwest::Client,
+        channel_id: &str,
+    ) -> ChannelMeta {
         {
-            let cache = self.thread_channels.lock().await;
-            if let Some(&value) = cache.get(channel_id) {
-                return value;
+            let cache = self.channel_meta.lock().await;
+            if let Some(meta) = cache.get(channel_id) {
+                return meta.clone();
             }
         }
 
-        // Only a successful API response is cached. A transient network blip
-        // or 429 must not poison the cache for the channel's lifetime; the
-        // next message should retry the lookup. Failure paths return `false`
-        // (the safe default) without writing to the cache. The whole request
-        // is wrapped in an explicit timeout so a hung Discord API call can
-        // never stall the listener; the shared channel HTTP client may not
-        // carry a request-level timeout.
         let url = format!("https://discord.com/api/v10/channels/{channel_id}");
         let lookup = async {
             let resp = client
@@ -204,18 +266,25 @@ impl DiscordChannel {
                 .json()
                 .await
                 .map_err(|e| anyhow!("body parse failed: {e}"))?;
-            Ok::<bool, anyhow::Error>(
-                body.get("type")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(is_thread_channel_type)
-                    .unwrap_or(false),
-            )
+            let is_thread = body
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .map(is_thread_channel_type)
+                .unwrap_or(false);
+            let parent_id = body
+                .get("parent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            Ok::<ChannelMeta, anyhow::Error>(ChannelMeta {
+                is_thread,
+                parent_id,
+            })
         };
-        let is_thread = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+        let meta = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => {
                 tracing::debug!(channel_id, error = %e, "discord: channel lookup failed");
-                return false;
+                return ChannelMeta::default();
             }
             Err(_) => {
                 tracing::debug!(
@@ -223,15 +292,82 @@ impl DiscordChannel {
                     timeout_secs = THREAD_LOOKUP_TIMEOUT.as_secs(),
                     "discord: channel lookup timed out"
                 );
+                return ChannelMeta::default();
+            }
+        };
+
+        self.channel_meta
+            .lock()
+            .await
+            .insert(channel_id.to_string(), meta.clone());
+        meta
+    }
+
+    /// Resolve whether the bot is a member of `thread_id` via
+    /// `GET /channels/{thread_id}/thread-members/@me`. 200 means member,
+    /// 404 means not. Results are TTL-cached (`THREAD_MEMBERSHIP_TTL`) so a
+    /// bot that was removed mid-process stops bypassing the mention gate
+    /// within minutes. Lookup failures fall through to `false` and are not
+    /// cached.
+    async fn bot_is_thread_member(
+        &self,
+        client: &reqwest::Client,
+        thread_id: &str,
+    ) -> bool {
+        {
+            let cache = self.thread_membership.lock().await;
+            if let Some(&(is_member, expires_at)) = cache.get(thread_id)
+                && expires_at > Instant::now()
+            {
+                return is_member;
+            }
+        }
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{thread_id}/thread-members/@me"
+        );
+        let lookup = async {
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .send()
+                .await
+                .map_err(|e| anyhow!("request failed: {e}"))?;
+            // 200 OK = member, 404 = not member. Anything else is an
+            // unexpected response we don't want to cache.
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok::<bool, anyhow::Error>(false);
+            }
+            if !resp.status().is_success() {
+                anyhow::bail!("non-success status {}", resp.status());
+            }
+            Ok::<bool, anyhow::Error>(true)
+        };
+        let is_member = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    thread_id,
+                    error = %e,
+                    "discord: thread-member lookup failed"
+                );
+                return false;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    thread_id,
+                    timeout_secs = THREAD_LOOKUP_TIMEOUT.as_secs(),
+                    "discord: thread-member lookup timed out"
+                );
                 return false;
             }
         };
 
-        self.thread_channels
-            .lock()
-            .await
-            .insert(channel_id.to_string(), is_thread);
-        is_thread
+        self.thread_membership.lock().await.insert(
+            thread_id.to_string(),
+            (is_member, Instant::now() + THREAD_MEMBERSHIP_TTL),
+        );
+        is_member
     }
 
     /// Apply the trust-boundary / delivery-failure emoji reactions to the
@@ -927,7 +1063,12 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
-const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
+/// Reaction emoji added to inbound user messages while the agent is
+/// working, and removed once the response is sent. Hardcoded to a single
+/// emoji so the cleanup path can target the same character that was
+/// added — earlier code picked from a pool, which left orphaned
+/// reactions whenever the random choice didn't match the cleanup constant.
+const DISCORD_ACK_REACTION: &str = "\u{1F440}"; // 👀
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
 /// Tries to split at word boundaries when possible.
@@ -1061,24 +1202,6 @@ fn chunks_for_send(
     chunks
 }
 
-fn pick_uniform_index(len: usize) -> usize {
-    debug_assert!(len > 0);
-    let upper = len as u64;
-    let reject_threshold = (u64::MAX / upper) * upper;
-
-    loop {
-        let value = rand::random::<u64>();
-        if value < reject_threshold {
-            #[allow(clippy::cast_possible_truncation)]
-            return (value % upper) as usize;
-        }
-    }
-}
-
-fn random_discord_ack_reaction() -> &'static str {
-    DISCORD_ACK_REACTIONS[pick_uniform_index(DISCORD_ACK_REACTIONS.len())]
-}
-
 /// URL-encode a Unicode emoji for use in Discord reaction API paths.
 ///
 /// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
@@ -1143,6 +1266,65 @@ fn admit_discord_message(
     }
 
     Some(normalized)
+}
+
+/// Match `channel_id` (and the optional thread `parent_id`) against a list
+/// of channel-ID overrides. Returns true if either ID is in `list`.
+fn matches_channel_list(
+    list: &[String],
+    channel_id: &str,
+    parent_id: Option<&str>,
+) -> bool {
+    list.iter().any(|id| {
+        id == channel_id || parent_id.is_some_and(|p| id == p)
+    })
+}
+
+/// Decide whether a guild/thread message passes the channel allow/block
+/// filter. DMs bypass channel filtering entirely (they're scoped by
+/// `allowed_users`). Blocklist wins when a channel appears in both.
+fn channel_admitted_by_filter(
+    is_dm: bool,
+    channel_id: &str,
+    parent_id: Option<&str>,
+    allowlist: &[String],
+    blocklist: &[String],
+) -> bool {
+    if is_dm {
+        return true;
+    }
+    if matches_channel_list(blocklist, channel_id, parent_id) {
+        return false;
+    }
+    if allowlist.is_empty() {
+        return true;
+    }
+    matches_channel_list(allowlist, channel_id, parent_id)
+}
+
+/// Resolve the effective mention requirement for a non-thread-membership
+/// decision. Priority: DMs never require a mention; `mention_free_channels`
+/// wins over `mention_required_channels`; otherwise fall back to the
+/// global `mention_only` setting. The thread-membership bypass is applied
+/// by the caller because it requires an async lookup.
+fn decide_effective_mention_only(
+    is_dm: bool,
+    channel_id: &str,
+    parent_id: Option<&str>,
+    mention_only: bool,
+    mention_free: &[String],
+    mention_required: &[String],
+) -> bool {
+    if is_dm {
+        return false;
+    }
+    if matches_channel_list(mention_free, channel_id, parent_id) {
+        return false;
+    }
+    if matches_channel_list(mention_required, channel_id, parent_id) {
+        return true;
+    }
+    mention_only
 }
 
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
@@ -1479,13 +1661,73 @@ impl Channel for DiscordChannel {
                     // inherently private and implicitly addressed to the bot, so bypass
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
-                    let effective_mention_only = self.mention_only && !is_dm;
                     let atts = d
                         .get("attachments")
                         .and_then(|a| a.as_array())
                         .cloned()
                         .unwrap_or_default();
                     let has_attachments = !atts.is_empty();
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let client = self.http_client();
+
+                    // Resolve channel metadata once. The lookup is cached for the
+                    // channel's lifetime, so this costs at most one extra Discord
+                    // API call per unique channel ID per process. DMs skip it
+                    // entirely because channel filters and the thread bypass
+                    // never apply to them.
+                    let channel_meta = if is_dm || channel_id.is_empty() {
+                        ChannelMeta::default()
+                    } else {
+                        self.lookup_channel_meta(&client, &channel_id).await
+                    };
+                    let parent_id = channel_meta.parent_id.as_deref();
+
+                    // Channel-ID allow/block filter. Allowlist accepts the
+                    // message channel ID or, for thread messages, the parent
+                    // channel ID. Blocklist wins when both lists name the
+                    // same channel.
+                    if !channel_admitted_by_filter(
+                        is_dm,
+                        &channel_id,
+                        parent_id,
+                        &self.channel_allowlist,
+                        &self.channel_blocklist,
+                    ) {
+                        tracing::debug!(
+                            channel_id = %channel_id,
+                            "discord: dropping message outside configured channel filter"
+                        );
+                        continue;
+                    }
+
+                    let mut effective_mention_only = decide_effective_mention_only(
+                        is_dm,
+                        &channel_id,
+                        parent_id,
+                        self.mention_only,
+                        &self.mention_free_channels,
+                        &self.mention_required_channels,
+                    );
+
+                    // Thread-membership bypass: when the channel is a thread,
+                    // the bot is a member of it, and the message doesn't
+                    // already carry an @-mention, drop the mention requirement
+                    // for this message. The membership lookup only fires when
+                    // the message would otherwise be rejected, so well-behaved
+                    // mention-rich traffic doesn't pay for it.
+                    if effective_mention_only
+                        && self.mention_free_in_threads
+                        && channel_meta.is_thread
+                        && !contains_bot_mention(content, &bot_user_id)
+                        && self.bot_is_thread_member(&client, &channel_id).await
+                    {
+                        effective_mention_only = false;
+                    }
+
                     let Some(clean_content) = admit_discord_message(
                         content,
                         has_attachments,
@@ -1495,7 +1737,6 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
-                    let client = self.http_client();
                     let (attachment_text, media_attachments) = process_attachments(
                         &atts,
                         &client,
@@ -1521,11 +1762,6 @@ impl Channel for DiscordChannel {
                     }
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
 
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
@@ -1537,7 +1773,7 @@ impl Channel for DiscordChannel {
                         );
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
-                        let reaction_emoji = random_discord_ack_reaction().to_string();
+                        let reaction_emoji = DISCORD_ACK_REACTION.to_string();
                         tokio::spawn(async move {
                             if let Err(err) = reaction_channel
                                 .add_reaction(
@@ -1556,19 +1792,10 @@ impl Channel for DiscordChannel {
 
                     // Thread context decides `thread_ts` plus `interruption_scope_id`,
                     // which the orchestrator uses as part of the conversation-history
-                    // key and the cancellation scope. When the lookup fails it falls
-                    // back to `None` and the failure is not cached, so the next
-                    // message in the same Discord thread will retry. The trade-off:
-                    // the first message after a transient lookup miss is keyed
-                    // without the thread suffix; once the cache warms, subsequent
-                    // messages are keyed with it. History for that thread can split
-                    // across two scopes until the warm-up completes. Acceptable
-                    // because the lookup is bounded by `THREAD_LOOKUP_TIMEOUT` and
-                    // the alternative (stalling the listener on a hung Discord call)
-                    // is worse.
-                    let thread_ts = if channel_id.is_empty() {
-                        None
-                    } else if self.is_thread_channel(&client, &channel_id).await {
+                    // key and the cancellation scope. We reuse the metadata
+                    // already resolved for the channel filter / mention-bypass
+                    // checks, so this costs no additional API call.
+                    let thread_ts = if channel_meta.is_thread {
                         Some(channel_id.clone())
                     } else {
                         None
@@ -2282,6 +2509,157 @@ mod tests {
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
+    // ── channel-filter + mention-override helpers ─────────────────
+
+    #[test]
+    fn channel_filter_dms_bypass_filter() {
+        // DMs are never subject to the channel-id filter; they're scoped
+        // by `allowed_users` instead.
+        assert!(channel_admitted_by_filter(
+            true,
+            "999",
+            None,
+            &["111".into()],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn channel_filter_empty_allowlist_admits_everything_outside_blocklist() {
+        assert!(channel_admitted_by_filter(false, "111", None, &[], &[]));
+        assert!(!channel_admitted_by_filter(
+            false,
+            "111",
+            None,
+            &[],
+            &["111".into()],
+        ));
+    }
+
+    #[test]
+    fn channel_filter_allowlist_admits_only_listed_channels() {
+        let allow = vec!["111".into(), "222".into()];
+        assert!(channel_admitted_by_filter(false, "111", None, &allow, &[]));
+        assert!(!channel_admitted_by_filter(false, "333", None, &allow, &[]));
+    }
+
+    #[test]
+    fn channel_filter_blocklist_wins_when_both_list_same_channel() {
+        let allow = vec!["111".into()];
+        let block = vec!["111".into()];
+        assert!(!channel_admitted_by_filter(false, "111", None, &allow, &block));
+    }
+
+    #[test]
+    fn channel_filter_allowlist_accepts_thread_via_parent() {
+        // A thread under an allowlisted parent passes even when the thread's
+        // own ID isn't listed.
+        let allow = vec!["parent-1".into()];
+        assert!(channel_admitted_by_filter(
+            false,
+            "thread-99",
+            Some("parent-1"),
+            &allow,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn channel_filter_blocklist_blocks_thread_via_parent() {
+        // A thread is denied when its parent is blocklisted, even if the
+        // thread's own ID is in the allowlist.
+        let allow = vec!["thread-99".into()];
+        let block = vec!["parent-1".into()];
+        assert!(!channel_admitted_by_filter(
+            false,
+            "thread-99",
+            Some("parent-1"),
+            &allow,
+            &block,
+        ));
+    }
+
+    #[test]
+    fn mention_override_free_channel_drops_mention_requirement() {
+        // Global mention_only = true, but the channel is listed as
+        // mention-free → no mention required.
+        let effective = decide_effective_mention_only(
+            false,
+            "111",
+            None,
+            true,
+            &["111".into()],
+            &[],
+        );
+        assert!(!effective);
+    }
+
+    #[test]
+    fn mention_override_required_channel_forces_mention() {
+        // Global mention_only = false, but the channel is listed as
+        // mention-required → mention required.
+        let effective = decide_effective_mention_only(
+            false,
+            "111",
+            None,
+            false,
+            &[],
+            &["111".into()],
+        );
+        assert!(effective);
+    }
+
+    #[test]
+    fn mention_override_free_wins_over_required_when_both_list_same_channel() {
+        let effective = decide_effective_mention_only(
+            false,
+            "111",
+            None,
+            true,
+            &["111".into()],
+            &["111".into()],
+        );
+        assert!(!effective);
+    }
+
+    #[test]
+    fn mention_override_thread_inherits_parent_override() {
+        // A thread inherits the parent's mention-free override.
+        let effective = decide_effective_mention_only(
+            false,
+            "thread-99",
+            Some("parent-1"),
+            true,
+            &["parent-1".into()],
+            &[],
+        );
+        assert!(!effective);
+    }
+
+    #[test]
+    fn mention_override_dm_always_mention_free() {
+        // DMs never require a mention, regardless of overrides.
+        let effective = decide_effective_mention_only(
+            true,
+            "dm-1",
+            None,
+            true,
+            &[],
+            &["dm-1".into()],
+        );
+        assert!(!effective);
+    }
+
+    #[test]
+    fn mention_override_falls_back_to_global_when_no_match() {
+        assert!(decide_effective_mention_only(
+            false, "999", None, true, &[], &[]
+        ));
+        assert!(!decide_effective_mention_only(
+            false, "999", None, false, &[], &[]
+        ));
+    }
+
     // Message splitting tests
 
     #[test]
@@ -2510,12 +2888,13 @@ mod tests {
         assert_eq!(encoded, "%41");
     }
 
+    /// The listener-side ACK reaction must match the orchestrator's
+    /// cleanup target so a working-indicator emoji is never orphaned.
+    /// The orchestrator hardcodes "\u{1F440}" (👀) on its add+remove
+    /// cycle; this test guards the listener constant against drift.
     #[test]
-    fn random_discord_ack_reaction_is_from_pool() {
-        for _ in 0..128 {
-            let emoji = random_discord_ack_reaction();
-            assert!(DISCORD_ACK_REACTIONS.contains(&emoji));
-        }
+    fn discord_ack_reaction_matches_orchestrator_cleanup_target() {
+        assert_eq!(DISCORD_ACK_REACTION, "\u{1F440}");
     }
 
     #[test]
