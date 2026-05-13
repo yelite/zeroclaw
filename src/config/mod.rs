@@ -87,16 +87,7 @@ mod tests {
             enabled: true,
             bot_token: "token".into(),
             guild_id: Some("123".into()),
-            allowed_users: vec![],
-            listen_to_bots: false,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            proxy_url: None,
-            stream_mode: StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            multi_message_delay_ms: 800,
-            stall_timeout_secs: 0,
-            approval_timeout_secs: 300,
+            ..Default::default()
         };
 
         let lark = LarkConfig {
