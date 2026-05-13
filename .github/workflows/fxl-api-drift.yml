@@ -1,0 +1,68 @@
+name: Fxl API Drift Check
+
+# Fork-local check: web/src/lib/api-generated.ts is intentionally
+# committed on this fork (upstream keeps it gitignored). This workflow
+# regenerates the TS client from the gateway's runtime OpenAPI spec on
+# every PR/push targeting fxl and fails if the committed file no longer
+# matches — i.e. someone changed a route or schema without running
+# `cargo web gen-api` locally.
+#
+# Removing this check means Nix consumers that fetch the fork can build
+# without npm/openapi-typescript, which is the whole point of checking
+# the generated file in. Keep this workflow green and downstream
+# packaging stays simple.
+
+on:
+  push:
+    branches: [fxl]
+  pull_request:
+    branches: [fxl]
+
+concurrency:
+  group: fxl-api-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  api-drift:
+    name: Check api-generated.ts is in sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/fxl' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: Regenerate TypeScript client
+        run: cargo web gen-api
+      - name: Fail if api-generated.ts drifted
+        run: |
+          if ! git diff --exit-code --stat web/src/lib/api-generated.ts; then
+            echo "::error file=web/src/lib/api-generated.ts::Generated TS client is out of date relative to the gateway's OpenAPI spec."
+            echo ""
+            echo "Fix: run \`cargo web gen-api\` locally and commit the resulting web/src/lib/api-generated.ts."
+            echo ""
+            echo "Full diff:"
+            git --no-pager diff web/src/lib/api-generated.ts
+            exit 1
+          fi

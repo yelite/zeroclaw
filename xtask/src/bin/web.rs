@@ -2,10 +2,14 @@
 //!
 //! Subcommands:
 //!   gen-api  — render the gateway's OpenAPI 3.1 spec in-process, write
-//!              it to `target/openapi.json` (gitignored), and feed it to
-//!              `npx openapi-typescript` to produce
-//!              `web/src/lib/api-generated.ts`. Neither file is
-//!              committed; both are derived artifacts.
+//!              it to `target/openapi.json` (gitignored, transient
+//!              handoff), and feed it to `npx openapi-typescript` to
+//!              produce `web/src/lib/api-generated.ts`. The TS client is
+//!              CHECKED IN on this fork (upstream gitignores it); the
+//!              `fxl-api-drift` CI workflow re-runs this command on
+//!              every PR and fails when the committed file drifts.
+//!              That makes the npm dependency optional for downstream
+//!              packaging (Nix builds in particular).
 //!   install  — `npm install` in `web/`.
 //!   build    — gen-api + `npm run build` (vite production bundle).
 //!   dev      — gen-api + `npm run dev` (vite dev server).

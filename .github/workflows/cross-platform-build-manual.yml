@@ -30,8 +30,8 @@ jobs:
         # `cargo web build` is the xtask wrapper that:
         # 1. renders the gateway's OpenAPI 3.1 spec in-process,
         # 2. runs `npx openapi-typescript` to produce
-        #    `web/src/lib/api-generated.ts` (gitignored — never
-        #    committed since #4f60f4405),
+        #    `web/src/lib/api-generated.ts` (committed on this fork;
+        #    drift caught by `.github/workflows/fxl-api-drift.yml`),
         # 3. runs `npm ci` + `npm run build` (tsc + vite).
         # Plain `cd web && npm run build` skips step 1+2 and tsc
         # fails on the missing import.
